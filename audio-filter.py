@@ -1,77 +1,323 @@
-import numpy as np
-import scipy.signal as signal
-import scipy.io.wavfile as wav
-import matplotlib.pyplot as plt
 import os
+import random
+import json
+from collections import defaultdict
 
-# ---------------------------
-# Band-pass filter function
-# ---------------------------
-def bandpass_filter(data, fs, lowcut=18000, highcut=20000, order=4):
-    nyq = 0.5 * fs
-    low, high = lowcut / nyq, highcut / nyq
-    b, a = signal.butter(order, [low, high], btype='band')
-    return signal.filtfilt(b, a, data)
+import numpy as np
+import pandas as pd
+import librosa
+import pywt
+import cv2
 
-# ---------------------------
-# File paths
-# ---------------------------
-input_dir = "/home/think-mint/ChirApp-Recordings/"
-file_to_convert = "eating.wav"
-output_dir = "/home/think-mint/Converted-WAV-Recordings"
-os.makedirs(output_dir, exist_ok=True)
+from scipy.signal import butter, lfilter
 
-input_path = os.path.join(input_dir, file_to_convert)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
 
-# ---------------------------
-# Read and process the file
-# ---------------------------
-fs, data = wav.read(input_path)
-data = data.astype(float)
-
-# Convert to mono if stereo
-if data.ndim > 1:
-    data = np.mean(data, axis=1)
-
-# Create time vector
-t = np.arange(len(data)) / fs
-
-# Apply band-pass filter (18–20 kHz)
-filtered = bandpass_filter(data, fs)
-
-# FFT for frequency analysis
-freq_domain = np.fft.fft(data)
-freqs = np.fft.fftfreq(len(data), 1 / fs)
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from tensorflow.keras.callbacks import EarlyStopping
 
 
-plt.figure(figsize=(12, 8))
+POSITIVE_DIR = ''
+NEGATIVE_DIR = ''
 
-plt.subplot(3, 1, 1)
-plt.plot(t, data, color='gray')
-plt.title("Original Signal")
-plt.xlabel("Time [s]")
-plt.ylabel("Amplitude")
+LOAD_POSITIVE = True
+LOAD_NEGATIVE = True
 
-plt.subplot(3, 1, 2)
-plt.plot(t, filtered, color='blue')
-plt.title("Filtered Signal (18–20 kHz)")
-plt.xlabel("Time [s]")
-plt.ylabel("Amplitude")
 
-plt.subplot(3, 1, 3)
-plt.specgram(filtered, Fs=fs, NFFT=1024, noverlap=512, cmap='viridis')
-plt.title("Spectrogram (Filtered Signal)")
-plt.xlabel("Time [s]")
-plt.ylabel("Frequency [Hz]")
-plt.colorbar(label="Intensity [dB]")
+SAMPLE_RATE = 44100
+LOWCUT = 17500.0
+HIGHCUT = 20500.0
+FILTER_ORDER = 6
+T_VALUES = [1, 2, 4]
 
-plt.tight_layout()
-plt.show()
 
-# ---------------------------
-# Save filtered data as .pmc
-# ---------------------------
-pmc_path = os.path.join(output_dir, file_to_convert.replace(".wav", ".pmc"))
-filtered.astype(np.float32).tofile(pmc_path)
+SEED = 42
+np.random.seed(SEED)
+random.seed(SEED)
+tf.random.set_seed(SEED)
 
-print(f"Processed: {file_to_convert} → {pmc_path}")
+
+def butter_bandpass_filter(data, lowcut, highcut, fs, order=5):
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    if low <= 0 or high >= 1 or low >= high:
+        
+        print(f"[WARN] Invalid bandpass normalized values (low={low:.3f}, high={high:.3f}). Skipping filter.")
+        return data
+    b, a = butter(order, [low, high], btype='band')
+    y = lfilter(b, a, data)
+    return y
+
+
+def load_and_clean_audio(file_path):
+    try:
+        if file_path.lower().endswith(".pcm"):
+            signal = np.fromfile(file_path, dtype=np.int16).astype(np.float32) / 32768.0
+        else:
+            signal, _ = librosa.load(file_path, sr=SAMPLE_RATE, mono=True)
+
+        # Apply bandpass filter
+        cleaned = butter_bandpass_filter(signal, LOWCUT, HIGHCUT, SAMPLE_RATE, FILTER_ORDER)
+        return cleaned
+
+    except Exception as e:
+        print(f"Error reading {file_path}: {e}")
+        return None
+
+
+
+def segment_signal(signal, period_seconds):
+    samples_per_segment = int(SAMPLE_RATE * period_seconds)
+    segments = []
+    if len(signal) < samples_per_segment:
+        return np.array([])
+    for i in range(0, len(signal), samples_per_segment):
+        segment = signal[i:i + samples_per_segment]
+        if len(segment) == samples_per_segment:
+            segments.append(segment)
+    return np.array(segments)
+
+
+
+def get_wavelet_features(segment, wavelet='db4', level=4):
+    # truncate to reasonable length if extremely short
+    try:
+        coeffs = pywt.wavedec(segment, wavelet, level=level)
+    except Exception:
+        coeffs = pywt.wavedec(segment, wavelet, level=1)
+    feats = []
+    for c in coeffs[1:]:
+        feats.extend([
+            np.mean(c),
+            np.std(c),
+            np.max(c),
+            np.min(c),
+            np.mean(c**2)
+        ])
+    return np.array(feats)
+
+
+def get_statistical_features(segment):
+    zcr = librosa.feature.zero_crossing_rate(segment)[0]
+    return np.array([
+        np.mean(segment),
+        np.std(segment),
+        np.max(segment),
+        np.min(segment),
+        np.mean(segment**2),
+        np.mean(zcr)
+    ], dtype=np.float32)
+
+
+def get_mel_spectrogram(segment, sr=SAMPLE_RATE, n_mels=64, n_fft=2048, fixed_frames=64):
+
+    hop_length = max(64, int(np.floor(len(segment) / (fixed_frames - 1))))
+    S = librosa.feature.melspectrogram(y=segment, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels)
+    S_db = librosa.power_to_db(S, ref=np.max)
+    
+    if S_db.shape[1] < fixed_frames:
+        pad_width = fixed_frames - S_db.shape[1]
+        S_db = np.pad(S_db, ((0, 0), (0, pad_width)), mode='constant', constant_values=(S_db.min(),))
+    elif S_db.shape[1] > fixed_frames:
+        S_db = S_db[:, :fixed_frames]
+    return S_db.astype(np.float32)[..., np.newaxis]
+
+
+def get_mfcc_fixed(segment, sr=SAMPLE_RATE, n_mfcc=40, fixed_frames=64):
+    hop_length = max(64, int(np.floor(len(segment) / (fixed_frames - 1))))
+    mfcc = librosa.feature.mfcc(y=segment, sr=sr, n_mfcc=n_mfcc, hop_length=hop_length)
+    if mfcc.shape[1] < fixed_frames:
+        pad_width = fixed_frames - mfcc.shape[1]
+        mfcc = np.pad(mfcc, ((0,0),(0,pad_width)), mode='constant', constant_values=(mfcc.min(),))
+    elif mfcc.shape[1] > fixed_frames:
+        mfcc = mfcc[:, :fixed_frames]
+    return mfcc.astype(np.float32)[..., np.newaxis]
+
+
+def get_stft_image(segment, n_fft=2048, fixed_size=(64,64)):
+    D = np.abs(librosa.stft(segment, n_fft=n_fft))
+    S_db = librosa.amplitude_to_db(D, ref=np.max)
+
+    resized = cv2.resize(S_db, fixed_size, interpolation=cv2.INTER_CUBIC)
+    return resized.astype(np.float32)[..., np.newaxis]
+
+
+def load_dataset_dynamic(period):
+    features_stat = []
+    features_wave = []
+    features_spec = []
+    features_mfcc = []
+    labels = []
+
+    directories = []
+    if LOAD_POSITIVE:
+        directories.append((POSITIVE_DIR, 1))
+    if LOAD_NEGATIVE:
+        directories.append((NEGATIVE_DIR, 0))
+
+    if not directories:
+        print("Error: Both LOAD_POSITIVE and LOAD_NEGATIVE are False. Nothing to do.")
+        return (np.array([]), np.array([]), np.array([]), np.array([]), np.array([]))
+
+    for dir_path, label_val in directories:
+        if not os.path.exists(dir_path):
+            print(f"Warning: Folder not found: {dir_path}")
+            continue
+        files = [f for f in os.listdir(dir_path) if f.lower().endswith(('.wav', '.pcm'))]
+        print(f"  Processing {len(files)} files from {dir_path}...")
+
+        for file in files:
+            f_path = os.path.join(dir_path, file)
+            signal = load_and_clean_audio(f_path)
+            if signal is None:
+                continue
+            segments = segment_signal(signal, period)
+            for seg in segments:
+                features_stat.append(get_statistical_features(seg))
+                features_wave.append(get_wavelet_features(seg))
+                features_spec.append(get_mel_spectrogram(seg))
+                features_mfcc.append(get_mfcc_fixed(seg))
+                labels.append(label_val)
+
+    if len(labels) == 0:
+        return (np.array([]), np.array([]), np.array([]), np.array([]), np.array([]))
+
+    return (np.array(features_stat), np.array(features_wave), np.array(features_spec), np.array(features_mfcc), np.array(labels))
+
+
+
+def train_classic_ml(X, y, model_name="SVM", n_splits=5):
+    if model_name == "SVM":
+        clf = SVC(kernel='rbf', probability=True, random_state=SEED)
+    elif model_name == "RF":
+        clf = RandomForestClassifier(n_estimators=100, random_state=SEED)
+    elif model_name == "kNN":
+        clf = KNeighborsClassifier(n_neighbors=5)
+    else:
+        raise ValueError("Unknown model")
+
+    pipe = Pipeline([('scaler', StandardScaler()), ('clf', clf)])
+    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=SEED)
+    scoring = ['accuracy', 'precision', 'recall', 'f1']
+    scores = cross_validate(pipe, X, y, cv=cv, scoring=scoring, return_train_score=False)
+    results = {metric: (scores[f'test_{metric}'].mean(), scores[f'test_{metric}'].std()) for metric in scoring}
+    return results
+
+
+
+def build_simple_cnn(input_shape):
+    model = models.Sequential([
+        layers.Input(shape=input_shape),
+        layers.Conv2D(16, (3,3), activation='relu'),
+        layers.MaxPooling2D((2,2)),
+        layers.Conv2D(32, (3,3), activation='relu'),
+        layers.MaxPooling2D((2,2)),
+        layers.Flatten(),
+        layers.Dense(64, activation='relu'),
+        layers.Dropout(0.4),
+        layers.Dense(1, activation='sigmoid')
+    ])
+    model.compile(optimizer='adam', loss='binary_crossentropy', metrics=['accuracy'])
+    return model
+
+
+def train_cnn_cv(X, y, input_shape, n_splits=5, epochs=20, batch_size=16):
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=SEED)
+    metrics = defaultdict(list)
+
+    for fold, (train_idx, test_idx) in enumerate(skf.split(X, y)):
+        X_train, X_test = X[train_idx], X[test_idx]
+        y_train, y_test = y[train_idx], y[test_idx]
+
+        
+        mean = X_train.mean()
+        std = X_train.std() if X_train.std() > 0 else 1.0
+        X_train = (X_train - mean) / std
+        X_test = (X_test - mean) / std
+
+        model = build_simple_cnn(input_shape)
+        es = EarlyStopping(patience=3, restore_best_weights=True)
+        
+        model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, validation_split=0.1, callbacks=[es], verbose=0)
+        y_pred_prob = model.predict(X_test, verbose=0).ravel()
+        y_pred = (y_pred_prob > 0.5).astype(int)
+
+        metrics['accuracy'].append(accuracy_score(y_test, y_pred))
+        metrics['precision'].append(precision_score(y_test, y_pred, zero_division=0))
+        metrics['recall'].append(recall_score(y_test, y_pred, zero_division=0))
+        metrics['f1'].append(f1_score(y_test, y_pred, zero_division=0))
+
+        tf.keras.backend.clear_session()
+
+    return {m: (np.mean(v), np.std(v)) for m, v in metrics.items()}
+
+
+
+def main():
+    print(f"Starting pipeline (POS={LOAD_POSITIVE}, NEG={LOAD_NEGATIVE})")
+    results_rows = []
+
+    for T in T_VALUES:
+        print(f"\n=== Period T = {T}s ===")
+        X_stat, X_wave, X_spec, X_mfcc, y = load_dataset_dynamic(T)
+        if len(y) == 0:
+            print("No samples found for this T. Skipping.")
+            continue
+        print(f"Total samples: {len(y)} | Pos:{np.sum(y==1)} Neg:{np.sum(y==0)}")
+
+        # Check classes
+        if len(np.unique(y)) < 2:
+            print("Need at least two classes (positive & negative). Skipping this T.")
+            continue
+
+        # CLASSIC ML on stat + wavelet
+        for modality_name, X in [('stat', X_stat), ('wavelet', X_wave)]:
+            if X.size == 0:
+                continue
+            
+            X2 = X.reshape((X.shape[0], -1)) if X.ndim > 2 else X
+            print(f"Training classic models on {modality_name} features: shape={X2.shape}")
+            for model_name in ['SVM','RF','kNN']:
+                res = train_classic_ml(X2, y, model_name)
+                print(f"  {model_name} ({modality_name}): acc={res['accuracy'][0]:.3f}\u00B1{res['accuracy'][1]:.3f}, "
+                      f"prec={res['precision'][0]:.3f}, rec={res['recall'][0]:.3f}, f1={res['f1'][0]:.3f}")
+                results_rows.append({
+                    'T': T, 'model': model_name, 'modality': modality_name,
+                    'accuracy_mean': float(res['accuracy'][0]), 'accuracy_std': float(res['accuracy'][1]),
+                    'precision_mean': float(res['precision'][0]), 'recall_mean': float(res['recall'][0]), 'f1_mean': float(res['f1'][0])
+                })
+
+        
+        for modality_name, X in [('mel_spec', X_spec), ('mfcc', X_mfcc)]:
+            if X.size == 0:
+                continue
+            print(f"Training CNN on {modality_name} with input shape {X[0].shape}")
+            # ensure X is float32
+            X_float = X.astype(np.float32)
+            res = train_cnn_cv(X_float, y, input_shape=X_float[0].shape)
+            print(f"  CNN ({modality_name}): acc={res['accuracy'][0]:.3f}\u00B1{res['accuracy'][1]:.3f}, "
+                  f"prec={res['precision'][0]:.3f}, rec={res['recall'][0]:.3f}, f1={res['f1'][0]:.3f}")
+            results_rows.append({
+                'T': T, 'model': 'CNN', 'modality': modality_name,
+                'accuracy_mean': float(res['accuracy'][0]), 'accuracy_std': float(res['accuracy'][1]),
+                'precision_mean': float(res['precision'][0]), 'recall_mean': float(res['recall'][0]), 'f1_mean': float(res['f1'][0])
+            })
+
+    if len(results_rows) > 0:
+        df = pd.DataFrame(results_rows)
+        out_csv = 'model_results.csv'
+        df.to_csv(out_csv, index=False)
+        print(f"\nSaved results to {out_csv}")
+    else:
+        print("No results to save.")
+
+if __name__ == '__main__':
+    main()
