@@ -1,0 +1,38 @@
+# --- Python ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# --- Virtual Environment ---
+# Matches the folder you created
+venv/
+env/
+.env
+
+# --- IDE Settings ---
+.vscode/
+.idea/
+*.swp
+
+# --- Project Data (Important!) ---
+# Ignore the large audio recordings
+*.wav
+*.pcm
+*.mp3
+
+# Ignore the directories defined in your script
+Positive-State/
+Negative-State/
+data/
+
+# --- Outputs ---
+# Ignore the results CSV if you don't want to track history of every run
+# Comment this out if you DO want to save your results to GitHub
+model_results.csv
+final_results.csv
+final_results_with_averages.csv
+
+# Ignore generated images/plots
+*.png
+*.jpg
